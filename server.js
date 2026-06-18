@@ -83,15 +83,23 @@ app.get('/api/limit', (req,res) => {
   });
 });
 
+// Kurucu UID — sınırsız erişim
+const FOUNDER_UID = 'l8Tih1awnjP7fRXnUsFVVAuXEZu2';
+
 app.post('/api/messages', async (req,res) => {
   const ip = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip;
-  if(checkAbuse(ip)) return res.status(429).json({error:{message:'Erişim engellendi.'}});
-  if(!API_KEY)       return res.status(500).json({error:{message:'Missing API key.'}});
+  const uid = req.body.uid || '';
+  const isFounder = uid === FOUNDER_UID;
+
+  if(!isFounder && checkAbuse(ip)) return res.status(429).json({error:{message:'Erişim engellendi.'}});
+  if(!API_KEY) return res.status(500).json({error:{message:'Missing API key.'}});
 
   const { system, messages=[], max_tokens=4000, isDeck } = req.body;
 
-  const limitCheck = checkLimit(ip, isDeck);
-  if(limitCheck.limited) return res.status(429).json({error:{message: limitCheck.reason}});
+  if(!isFounder){
+    const limitCheck = checkLimit(ip, isDeck);
+    if(limitCheck.limited) return res.status(429).json({error:{message: limitCheck.reason}});
+  }
 
   const msgs = [];
   if(system) msgs.push({role:'system', content:system});
