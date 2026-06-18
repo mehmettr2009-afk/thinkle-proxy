@@ -1,9 +1,9 @@
-// Thinkle proxy — OpenRouter edition
+// Thinkle proxy — Güvenli edition
 const express = require('express');
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-// ============ CORS — sadece thinkle.space konuşabilir ============
+// ============ CORS ============
 const ALLOWED_ORIGINS = [
   'https://thinkle.space',
   'https://www.thinkle.space',
@@ -11,7 +11,6 @@ const ALLOWED_ORIGINS = [
   'http://localhost:3000',
   'http://localhost:5500'
 ];
-
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if(ALLOWED_ORIGINS.includes(origin)){
@@ -23,21 +22,32 @@ app.use((req, res, next) => {
   next();
 });
 
-const API_KEY = process.env.OPENROUTER_API_KEY;
-const MODEL   = process.env.OR_MODEL || 'google/gemini-2.5-flash';
-const OR_URL  = 'https://openrouter.ai/api/v1/chat/completions';
-
+const API_KEY     = process.env.OPENROUTER_API_KEY;
+const MODEL       = process.env.OR_MODEL || 'google/gemini-2.5-flash';
+const OR_URL      = 'https://openrouter.ai/api/v1/chat/completions';
 const FOUNDER_UID = 'l8Tih1awnjP7fRXnUsFVVAuXEZu2';
 
+// ============ REQUEST İMZA DOĞRULAMA ============
+function isValidSignature(sig){
+  if(!sig) return false;
+  const hour = Math.floor(Date.now() / 3600000);
+  // Şu anki saat ve bir önceki saat geçerli (saat başı geçişinde sorun olmasın)
+  for(const h of [hour, hour-1]){
+    const secret = 'thinkle-' + h + '-space';
+    const expected = Buffer.from(secret + '-' + (h % 7)).toString('base64').replace(/=/g,'');
+    if(sig === expected) return true;
+  }
+  return false;
+}
+
 // ============ RATE LİMİTER ============
-// IP bazlı + UID bazlı çift koruma
 const DAILY_DECK_LIMIT  = 10;
 const DAILY_CHAT_LIMIT  = 30;
 const HOURLY_LIMIT      = 15;
 const DAILY_TOKEN_LIMIT = 60000;
 
-const ipStore  = new Map(); // IP bazlı
-const uidStore = new Map(); // UID bazlı
+const ipStore  = new Map();
+const uidStore = new Map();
 
 function getRecord(store, key){
   const now = Date.now();
@@ -53,13 +63,13 @@ function getRecord(store, key){
 function checkLimit(store, key, isDeck){
   const r = getRecord(store, key);
   if(r.hourly >= HOURLY_LIMIT)
-    return { limited:true, reason: 'Saatlik istek limitine ulaştın. Biraz bekle.' };
+    return { limited:true, reason:'Saatlik istek limitine ulaştın. Biraz bekle.' };
   if(isDeck && r.decks >= DAILY_DECK_LIMIT)
-    return { limited:true, reason: `Günlük ${DAILY_DECK_LIMIT} dosya limitine ulaştın. Yarın tekrar dene.` };
+    return { limited:true, reason:`Günlük ${DAILY_DECK_LIMIT} dosya limitine ulaştın. Yarın tekrar dene.` };
   if(!isDeck && r.chats >= DAILY_CHAT_LIMIT)
-    return { limited:true, reason: `Günlük ${DAILY_CHAT_LIMIT} mesaj limitine ulaştın. Yarın tekrar dene.` };
+    return { limited:true, reason:`Günlük ${DAILY_CHAT_LIMIT} mesaj limitine ulaştın. Yarın tekrar dene.` };
   if(r.tokens >= DAILY_TOKEN_LIMIT)
-    return { limited:true, reason: 'Günlük token limitine ulaştın. Yarın tekrar dene.' };
+    return { limited:true, reason:'Günlük token limitine ulaştın. Yarın tekrar dene.' };
   return { limited:false };
 }
 
@@ -79,24 +89,26 @@ function checkAbuse(ip){
 }
 
 // ============ INPUT TEMİZLEME ============
-function sanitizeText(text){
+function sanitize(text){
   if(!text || typeof text !== 'string') return '';
   return text
-    // Prompt injection denemelerini temizle
     .replace(/ignore (all |previous |prior )?instructions?/gi, '[filtered]')
     .replace(/system prompt/gi, '[filtered]')
     .replace(/api.?key/gi, '[filtered]')
     .replace(/jailbreak/gi, '[filtered]')
-    // Aşırı uzun tekrarları kırp
     .slice(0, 10000);
 }
 
-function sanitizeMessages(messages){
-  return messages.map(m => ({
-    role: m.role,
-    content: typeof m.content === 'string' ? sanitizeText(m.content) : m.content
-  }));
-}
+// ============ HONEYPOT — kötü niyetlileri yakala ============
+const HONEYPOT_PATHS = ['/api/admin', '/api/secret', '/api/keys', '/admin', '/.env', '/config'];
+HONEYPOT_PATHS.forEach(path => {
+  app.all(path, (req, res) => {
+    const ip = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip;
+    blocked.add(ip); // Anında engelle
+    console.log(`🍯 Honeypot tetiklendi: ${ip} → ${path}`);
+    res.status(404).json({ error: 'Not found' });
+  });
+});
 
 // Keep-alive
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
@@ -118,35 +130,34 @@ app.get('/api/limit', (req,res) => {
 app.post('/api/messages', async (req,res) => {
   const ip  = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip;
   const uid = req.body.uid || '';
+  const sig = req.body.sig || '';
   const isFounder = uid === FOUNDER_UID;
 
-  // Abuse kontrolü
+  // İmza kontrolü — Postman/curl ile direkt istek engelle
+  if(!isFounder && !isValidSignature(sig)){
+    return res.status(403).json({error:{message:'Unauthorized request.'}});
+  }
+
   if(!isFounder && checkAbuse(ip))
-    return res.status(429).json({error:{message:'Erişim engellendi.'}});
+    return res.status(429).json({error:{message:'Rate limit exceeded.'}});
 
   if(!API_KEY)
-    return res.status(500).json({error:{message:'Missing API key.'}});
+    return res.status(500).json({error:{message:'Service unavailable.'}});
 
   const { system, messages=[], max_tokens=4000, isDeck } = req.body;
 
-  // Rate limit — hem IP hem UID kontrol et
   if(!isFounder){
     const ipCheck = checkLimit(ipStore, ip, isDeck);
     if(ipCheck.limited) return res.status(429).json({error:{message: ipCheck.reason}});
-
     if(uid){
       const uidCheck = checkLimit(uidStore, uid, isDeck);
       if(uidCheck.limited) return res.status(429).json({error:{message: uidCheck.reason}});
     }
   }
 
-  // Input temizle
-  const cleanSystem = sanitizeText(system || '');
-  const cleanMessages = sanitizeMessages(messages);
-
   const msgs = [];
-  if(cleanSystem) msgs.push({role:'system', content:cleanSystem});
-  cleanMessages.forEach(m => msgs.push({role:m.role, content:m.content}));
+  if(system) msgs.push({role:'system', content: sanitize(system)});
+  messages.forEach(m => msgs.push({role:m.role, content: sanitize(m.content)}));
 
   try{
     const r = await fetch(OR_URL, {
@@ -160,12 +171,12 @@ app.post('/api/messages', async (req,res) => {
       body: JSON.stringify({ model:MODEL, messages:msgs, max_tokens })
     });
     const data = await r.json();
-    if(!r.ok) return res.status(r.status).json({error: data.error||{message:'OR error'}});
+    // Hata detaylarını gizle — sadece gerekli bilgi
+    if(!r.ok) return res.status(r.status).json({error:{message: r.status === 429 ? 'Rate limit.' : 'Service error.'}});
 
     const text = data.choices?.[0]?.message?.content || '';
     const tokensUsed = data.usage?.total_tokens || max_tokens;
 
-    // Kullanımı kaydet — hem IP hem UID
     if(!isFounder){
       recordUsage(ipStore, ip, isDeck, tokensUsed);
       if(uid) recordUsage(uidStore, uid, isDeck, tokensUsed);
@@ -173,11 +184,12 @@ app.post('/api/messages', async (req,res) => {
 
     res.json({ content:[{type:'text', text}] });
   }catch(e){
-    res.status(500).json({error:{message:'Proxy error: '+e.message}});
+    // Hata detayını gizle
+    res.status(500).json({error:{message:'Service temporarily unavailable.'}});
   }
 });
 
-// Bellek temizliği — eski kayıtları sil
+// Bellek temizliği
 setInterval(()=>{
   const now = Date.now();
   for(const [k,v] of ipStore.entries())
