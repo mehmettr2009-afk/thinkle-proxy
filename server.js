@@ -6,7 +6,7 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
 const API_KEY = process.env.OPENROUTER_API_KEY;
-const MODEL   = process.env.OR_MODEL || 'meta-llama/llama-3.3-70b-instruct';
+const MODEL   = process.env.OR_MODEL || 'google/gemini-2.5-flash';
 const OR_URL  = 'https://openrouter.ai/api/v1/chat/completions';
 
 // ============ LİMİTLER ============
