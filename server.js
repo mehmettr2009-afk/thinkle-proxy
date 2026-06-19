@@ -1,4 +1,4 @@
-// Thinkle proxy — Güvenli edition
+// Thinkle proxy — Güvenli + Analitik edition
 const express = require('express');
 const app = express();
 app.use(express.json({ limit: '12mb' }));
@@ -27,17 +27,28 @@ const MODEL       = process.env.OR_MODEL || 'google/gemini-2.5-flash';
 const OR_URL      = 'https://openrouter.ai/api/v1/chat/completions';
 const FOUNDER_UID = 'l8Tih1awnjP7fRXnUsFVVAuXEZu2';
 
+// Gemini 2.5 Flash yaklaşık fiyatlandırma (OpenRouter, $/1M token)
+const PRICE_PER_M_INPUT  = 0.30;
+const PRICE_PER_M_OUTPUT = 2.50;
+
 // ============ REQUEST İMZA DOĞRULAMA ============
 function isValidSignature(sig){
   if(!sig) return false;
   const hour = Math.floor(Date.now() / 3600000);
-  // Şu anki saat ve bir önceki saat geçerli (saat başı geçişinde sorun olmasın)
   for(const h of [hour, hour-1]){
     const secret = 'thinkle-' + h + '-space';
     const expected = Buffer.from(secret + '-' + (h % 7)).toString('base64').replace(/=/g,'');
     if(sig === expected) return true;
   }
   return false;
+}
+
+// Kurucu paneli için basit token doğrulama (UID + sabit secret)
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'thinkle-admin-' + FOUNDER_UID.slice(0,8);
+function isAdminRequest(req){
+  const uid = req.body?.uid || req.query?.uid;
+  const token = req.headers['x-admin-token'] || req.body?.adminToken || req.query?.adminToken;
+  return uid === FOUNDER_UID && token === ADMIN_SECRET;
 }
 
 // ============ RATE LİMİTER ============
@@ -48,6 +59,10 @@ const DAILY_TOKEN_LIMIT = 60000;
 
 const ipStore  = new Map();
 const uidStore = new Map();
+
+// Manuel banlanan / özel limitli kullanıcılar (UID bazlı)
+const bannedUsers   = new Map(); // uid -> { reason, bannedAt }
+const unlimitedUsers = new Set(); // beta testçiler vb — sınırsız erişim
 
 function getRecord(store, key){
   const now = Date.now();
@@ -88,6 +103,46 @@ function checkAbuse(ip){
   return blocked.has(ip);
 }
 
+// ============ ANALİTİK — saatlik dağılım, hata sayacı, anomali ============
+const hourlyDistribution = new Array(24).fill(0); // bugünün saatlik istek sayısı
+let lastDistributionDay = new Date().toISOString().split('T')[0];
+
+let totalRequests = 0;
+let totalErrors   = 0;
+let totalInputTokens  = 0;
+let totalOutputTokens = 0;
+
+const recentDecks = []; // son oluşturulan deck başlıkları (moderasyon için), max 50
+const abuseReports = []; // şüpheli kullanım kayıtları, max 100
+
+function recordHourly(){
+  const today = new Date().toISOString().split('T')[0];
+  if(today !== lastDistributionDay){
+    hourlyDistribution.fill(0);
+    lastDistributionDay = today;
+  }
+  const hour = new Date().getHours();
+  hourlyDistribution[hour]++;
+}
+
+function recordAnomaly(ip, uid, hourly){
+  if(hourly === 41){ // tam abuse eşiğini geçtiği an bir kere kaydet
+    abuseReports.unshift({
+      type: 'rate_spike',
+      ip, uid: uid || '(anonim)',
+      detail: `Saatte ${hourly}+ istek — otomatik engellendi`,
+      time: new Date().toISOString()
+    });
+    if(abuseReports.length > 100) abuseReports.pop();
+  }
+}
+
+function recordDeckTitle(title, uid){
+  if(!title) return;
+  recentDecks.unshift({ title: String(title).slice(0,120), uid: uid || '(anonim)', time: new Date().toISOString() });
+  if(recentDecks.length > 50) recentDecks.pop();
+}
+
 // ============ INPUT TEMİZLEME ============
 function sanitize(text){
   if(!text) return '';
@@ -99,14 +154,12 @@ function sanitize(text){
       .replace(/jailbreak/gi, '[filtered]')
       .slice(0, 10000);
   }
-  // Vision mesajları — array of {type, text} veya {type, image_url}
   if(Array.isArray(text)){
     return text.map(part => {
       if(part.type === 'text' && typeof part.text === 'string'){
         return { type:'text', text: sanitize(part.text) };
       }
       if(part.type === 'image_url' && part.image_url?.url){
-        // Sadece data: URI'lere izin ver (base64 görseller), dış URL kabul etme
         if(typeof part.image_url.url === 'string' && part.image_url.url.startsWith('data:image/')){
           return part;
         }
@@ -118,13 +171,14 @@ function sanitize(text){
   return '';
 }
 
-// ============ HONEYPOT — kötü niyetlileri yakala ============
+// ============ HONEYPOT ============
 const HONEYPOT_PATHS = ['/api/admin', '/api/secret', '/api/keys', '/admin', '/.env', '/config'];
 HONEYPOT_PATHS.forEach(path => {
   app.all(path, (req, res) => {
     const ip = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip;
-    blocked.add(ip); // Anında engelle
-    console.log(`🍯 Honeypot tetiklendi: ${ip} → ${path}`);
+    blocked.add(ip);
+    abuseReports.unshift({ type:'honeypot', ip, uid:'-', detail:`Erişmeye çalıştı: ${path}`, time:new Date().toISOString() });
+    if(abuseReports.length > 100) abuseReports.pop();
     res.status(404).json({ error: 'Not found' });
   });
 });
@@ -146,31 +200,106 @@ app.get('/api/limit', (req,res) => {
   });
 });
 
+// ============ ADMIN ENDPOINTS — kurucu paneli ============
+app.get('/api/admin/stats', (req,res) => {
+  if(!isAdminRequest(req)) return res.status(403).json({error:'Unauthorized'});
+
+  const estimatedCost = (totalInputTokens/1e6 * PRICE_PER_M_INPUT) + (totalOutputTokens/1e6 * PRICE_PER_M_OUTPUT);
+
+  res.json({
+    totalRequests,
+    totalErrors,
+    errorRate: totalRequests ? +(totalErrors/totalRequests*100).toFixed(1) : 0,
+    hourlyDistribution,
+    estimatedCostUSD: +estimatedCost.toFixed(3),
+    totalInputTokens,
+    totalOutputTokens,
+    activeIPs: ipStore.size,
+    activeUsers: uidStore.size,
+    blockedIPs: Array.from(blocked),
+    bannedUsers: Array.from(bannedUsers.entries()).map(([uid,v]) => ({ uid, ...v })),
+    unlimitedUsers: Array.from(unlimitedUsers),
+    recentDecks: recentDecks.slice(0,20),
+    abuseReports: abuseReports.slice(0,20),
+    dailyTokenLimitPerUser: DAILY_TOKEN_LIMIT
+  });
+});
+
+app.post('/api/admin/ban', (req,res) => {
+  if(!isAdminRequest(req)) return res.status(403).json({error:'Unauthorized'});
+  const { targetUid, reason } = req.body;
+  if(!targetUid) return res.status(400).json({error:'targetUid required'});
+  if(targetUid === FOUNDER_UID) return res.status(400).json({error:'Kurucu banlanamaz'});
+  bannedUsers.set(targetUid, { reason: reason || 'Belirtilmedi', bannedAt: new Date().toISOString() });
+  unlimitedUsers.delete(targetUid);
+  res.json({ ok:true, banned: targetUid });
+});
+
+app.post('/api/admin/unban', (req,res) => {
+  if(!isAdminRequest(req)) return res.status(403).json({error:'Unauthorized'});
+  const { targetUid } = req.body;
+  bannedUsers.delete(targetUid);
+  res.json({ ok:true, unbanned: targetUid });
+});
+
+app.post('/api/admin/grant-unlimited', (req,res) => {
+  if(!isAdminRequest(req)) return res.status(403).json({error:'Unauthorized'});
+  const { targetUid } = req.body;
+  if(!targetUid) return res.status(400).json({error:'targetUid required'});
+  unlimitedUsers.add(targetUid);
+  bannedUsers.delete(targetUid);
+  res.json({ ok:true, unlimited: targetUid });
+});
+
+app.post('/api/admin/revoke-unlimited', (req,res) => {
+  if(!isAdminRequest(req)) return res.status(403).json({error:'Unauthorized'});
+  const { targetUid } = req.body;
+  unlimitedUsers.delete(targetUid);
+  res.json({ ok:true, revoked: targetUid });
+});
+
+// ============ ANA MESAJ ENDPOINT'İ ============
 app.post('/api/messages', async (req,res) => {
   const ip  = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip;
   const uid = req.body.uid || '';
   const sig = req.body.sig || '';
-  const isFounder = uid === FOUNDER_UID;
+  const isFounder    = uid === FOUNDER_UID;
+  const isUnlimited  = isFounder || unlimitedUsers.has(uid);
 
-  // İmza kontrolü — Postman/curl ile direkt istek engelle
+  totalRequests++;
+  recordHourly();
+
+  // Banlı kullanıcı kontrolü
+  if(uid && bannedUsers.has(uid)){
+    totalErrors++;
+    return res.status(403).json({error:{message:'Hesabınız kısıtlanmıştır.'}});
+  }
+
   if(!isFounder && !isValidSignature(sig)){
+    totalErrors++;
     return res.status(403).json({error:{message:'Unauthorized request.'}});
   }
 
-  if(!isFounder && checkAbuse(ip))
+  if(!isUnlimited && checkAbuse(ip)){
+    totalErrors++;
+    const r = getRecord(ipStore, ip);
+    recordAnomaly(ip, uid, r.hourly);
     return res.status(429).json({error:{message:'Rate limit exceeded.'}});
+  }
 
-  if(!API_KEY)
+  if(!API_KEY){
+    totalErrors++;
     return res.status(500).json({error:{message:'Service unavailable.'}});
+  }
 
   const { system, messages=[], max_tokens=4000, isDeck } = req.body;
 
-  if(!isFounder){
+  if(!isUnlimited){
     const ipCheck = checkLimit(ipStore, ip, isDeck);
-    if(ipCheck.limited) return res.status(429).json({error:{message: ipCheck.reason}});
+    if(ipCheck.limited){ totalErrors++; return res.status(429).json({error:{message: ipCheck.reason}}); }
     if(uid){
       const uidCheck = checkLimit(uidStore, uid, isDeck);
-      if(uidCheck.limited) return res.status(429).json({error:{message: uidCheck.reason}});
+      if(uidCheck.limited){ totalErrors++; return res.status(429).json({error:{message: uidCheck.reason}}); }
     }
   }
 
@@ -190,20 +319,35 @@ app.post('/api/messages', async (req,res) => {
       body: JSON.stringify({ model:MODEL, messages:msgs, max_tokens })
     });
     const data = await r.json();
-    // Hata detaylarını gizle — sadece gerekli bilgi
-    if(!r.ok) return res.status(r.status).json({error:{message: r.status === 429 ? 'Rate limit.' : 'Service error.'}});
+    if(!r.ok){
+      totalErrors++;
+      return res.status(r.status).json({error:{message: r.status === 429 ? 'Rate limit.' : 'Service error.'}});
+    }
 
     const text = data.choices?.[0]?.message?.content || '';
-    const tokensUsed = data.usage?.total_tokens || max_tokens;
+    const inputTokens  = data.usage?.prompt_tokens || 0;
+    const outputTokens = data.usage?.completion_tokens || 0;
+    const tokensUsed = data.usage?.total_tokens || (inputTokens+outputTokens) || max_tokens;
 
-    if(!isFounder){
+    totalInputTokens  += inputTokens;
+    totalOutputTokens += outputTokens;
+
+    if(!isUnlimited){
       recordUsage(ipStore, ip, isDeck, tokensUsed);
       if(uid) recordUsage(uidStore, uid, isDeck, tokensUsed);
     }
 
+    // Deck oluşturma ise başlığı moderasyon listesine kaydet (JSON içinden title yakala)
+    if(isDeck){
+      try{
+        const parsed = JSON.parse(text);
+        if(parsed?.title) recordDeckTitle(parsed.title, uid);
+      }catch(e){ /* JSON değilse atla */ }
+    }
+
     res.json({ content:[{type:'text', text}] });
   }catch(e){
-    // Hata detayını gizle
+    totalErrors++;
     res.status(500).json({error:{message:'Service temporarily unavailable.'}});
   }
 });
