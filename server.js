@@ -1,7 +1,7 @@
 // Thinkle proxy — Güvenli edition
 const express = require('express');
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '12mb' }));
 
 // ============ CORS ============
 const ALLOWED_ORIGINS = [
@@ -90,13 +90,32 @@ function checkAbuse(ip){
 
 // ============ INPUT TEMİZLEME ============
 function sanitize(text){
-  if(!text || typeof text !== 'string') return '';
-  return text
-    .replace(/ignore (all |previous |prior )?instructions?/gi, '[filtered]')
-    .replace(/system prompt/gi, '[filtered]')
-    .replace(/api.?key/gi, '[filtered]')
-    .replace(/jailbreak/gi, '[filtered]')
-    .slice(0, 10000);
+  if(!text) return '';
+  if(typeof text === 'string'){
+    return text
+      .replace(/ignore (all |previous |prior )?instructions?/gi, '[filtered]')
+      .replace(/system prompt/gi, '[filtered]')
+      .replace(/api.?key/gi, '[filtered]')
+      .replace(/jailbreak/gi, '[filtered]')
+      .slice(0, 10000);
+  }
+  // Vision mesajları — array of {type, text} veya {type, image_url}
+  if(Array.isArray(text)){
+    return text.map(part => {
+      if(part.type === 'text' && typeof part.text === 'string'){
+        return { type:'text', text: sanitize(part.text) };
+      }
+      if(part.type === 'image_url' && part.image_url?.url){
+        // Sadece data: URI'lere izin ver (base64 görseller), dış URL kabul etme
+        if(typeof part.image_url.url === 'string' && part.image_url.url.startsWith('data:image/')){
+          return part;
+        }
+        return null;
+      }
+      return null;
+    }).filter(Boolean);
+  }
+  return '';
 }
 
 // ============ HONEYPOT — kötü niyetlileri yakala ============
