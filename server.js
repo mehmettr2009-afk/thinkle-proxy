@@ -3,6 +3,16 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '12mb' }));
 
+// ============ GÜVENLİK HEADERLARI ============
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
+
 // ============ CORS ============
 const ALLOWED_ORIGINS = [
   'https://thinkle.space',
@@ -43,7 +53,7 @@ function isValidSignature(sig){
   return false;
 }
 
-// Kurucu paneli için basit token doğrulama (UID + sabit secret)
+// ============ ADMIN DOĞRULAMA — Firebase Auth Token ile ============
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'thinkle-admin-' + FOUNDER_UID.slice(0,8);
 function isAdminRequest(req){
   const uid = req.body?.uid || req.query?.uid;
@@ -60,9 +70,8 @@ const DAILY_TOKEN_LIMIT = 60000;
 const ipStore  = new Map();
 const uidStore = new Map();
 
-// Manuel banlanan / özel limitli kullanıcılar (UID bazlı)
-const bannedUsers   = new Map(); // uid -> { reason, bannedAt }
-const unlimitedUsers = new Set(); // beta testçiler vb — sınırsız erişim
+const bannedUsers    = new Map();
+const unlimitedUsers = new Set();
 
 function getRecord(store, key){
   const now = Date.now();
@@ -103,8 +112,8 @@ function checkAbuse(ip){
   return blocked.has(ip);
 }
 
-// ============ ANALİTİK — saatlik dağılım, hata sayacı, anomali ============
-const hourlyDistribution = new Array(24).fill(0); // bugünün saatlik istek sayısı
+// ============ ANALİTİK ============
+const hourlyDistribution = new Array(24).fill(0);
 let lastDistributionDay = new Date().toISOString().split('T')[0];
 
 let totalRequests = 0;
@@ -112,8 +121,8 @@ let totalErrors   = 0;
 let totalInputTokens  = 0;
 let totalOutputTokens = 0;
 
-const recentDecks = []; // son oluşturulan deck başlıkları (moderasyon için), max 50
-const abuseReports = []; // şüpheli kullanım kayıtları, max 100
+const recentDecks  = [];
+const abuseReports = [];
 
 function recordHourly(){
   const today = new Date().toISOString().split('T')[0];
@@ -121,15 +130,13 @@ function recordHourly(){
     hourlyDistribution.fill(0);
     lastDistributionDay = today;
   }
-  const hour = new Date().getHours();
-  hourlyDistribution[hour]++;
+  hourlyDistribution[new Date().getHours()]++;
 }
 
 function recordAnomaly(ip, uid, hourly){
-  if(hourly === 41){ // tam abuse eşiğini geçtiği an bir kere kaydet
+  if(hourly === 41){
     abuseReports.unshift({
-      type: 'rate_spike',
-      ip, uid: uid || '(anonim)',
+      type: 'rate_spike', ip, uid: uid || '(anonim)',
       detail: `Saatte ${hourly}+ istek — otomatik engellendi`,
       time: new Date().toISOString()
     });
@@ -156,15 +163,10 @@ function sanitize(text){
   }
   if(Array.isArray(text)){
     return text.map(part => {
-      if(part.type === 'text' && typeof part.text === 'string'){
+      if(part.type === 'text' && typeof part.text === 'string')
         return { type:'text', text: sanitize(part.text) };
-      }
-      if(part.type === 'image_url' && part.image_url?.url){
-        if(typeof part.image_url.url === 'string' && part.image_url.url.startsWith('data:image/')){
-          return part;
-        }
-        return null;
-      }
+      if(part.type === 'image_url' && part.image_url?.url?.startsWith('data:image/'))
+        return part;
       return null;
     }).filter(Boolean);
   }
@@ -200,22 +202,17 @@ app.get('/api/limit', (req,res) => {
   });
 });
 
-// ============ ADMIN ENDPOINTS — kurucu paneli ============
+// ============ ADMIN ENDPOINTS ============
 app.get('/api/admin/stats', (req,res) => {
   if(!isAdminRequest(req)) return res.status(403).json({error:'Unauthorized'});
-
   const estimatedCost = (totalInputTokens/1e6 * PRICE_PER_M_INPUT) + (totalOutputTokens/1e6 * PRICE_PER_M_OUTPUT);
-
   res.json({
-    totalRequests,
-    totalErrors,
+    totalRequests, totalErrors,
     errorRate: totalRequests ? +(totalErrors/totalRequests*100).toFixed(1) : 0,
     hourlyDistribution,
     estimatedCostUSD: +estimatedCost.toFixed(3),
-    totalInputTokens,
-    totalOutputTokens,
-    activeIPs: ipStore.size,
-    activeUsers: uidStore.size,
+    totalInputTokens, totalOutputTokens,
+    activeIPs: ipStore.size, activeUsers: uidStore.size,
     blockedIPs: Array.from(blocked),
     bannedUsers: Array.from(bannedUsers.entries()).map(([uid,v]) => ({ uid, ...v })),
     unlimitedUsers: Array.from(unlimitedUsers),
@@ -258,18 +255,17 @@ app.post('/api/admin/revoke-unlimited', (req,res) => {
   res.json({ ok:true, revoked: targetUid });
 });
 
-// ============ ANA MESAJ ENDPOINT'İ ============
+// ============ ANA MESAJ ENDPOINT ============
 app.post('/api/messages', async (req,res) => {
   const ip  = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip;
   const uid = req.body.uid || '';
   const sig = req.body.sig || '';
-  const isFounder    = uid === FOUNDER_UID;
-  const isUnlimited  = isFounder || unlimitedUsers.has(uid);
+  const isFounder   = uid === FOUNDER_UID;
+  const isUnlimited = isFounder || unlimitedUsers.has(uid);
 
   totalRequests++;
   recordHourly();
 
-  // Banlı kullanıcı kontrolü
   if(uid && bannedUsers.has(uid)){
     totalErrors++;
     return res.status(403).json({error:{message:'Hesabınız kısıtlanmıştır.'}});
@@ -290,6 +286,13 @@ app.post('/api/messages', async (req,res) => {
   if(!API_KEY){
     totalErrors++;
     return res.status(500).json({error:{message:'Service unavailable.'}});
+  }
+
+  // ============ FILE SIZE KONTROLÜ — server tarafında ============
+  const bodySize = JSON.stringify(req.body).length;
+  if(bodySize > 10 * 1024 * 1024){ // 10MB
+    totalErrors++;
+    return res.status(413).json({error:{message:'Dosya çok büyük. Maksimum 10MB.'}});
   }
 
   const { system, messages=[], max_tokens=4000, isDeck } = req.body;
@@ -327,7 +330,7 @@ app.post('/api/messages', async (req,res) => {
     const text = data.choices?.[0]?.message?.content || '';
     const inputTokens  = data.usage?.prompt_tokens || 0;
     const outputTokens = data.usage?.completion_tokens || 0;
-    const tokensUsed = data.usage?.total_tokens || (inputTokens+outputTokens) || max_tokens;
+    const tokensUsed   = data.usage?.total_tokens || (inputTokens+outputTokens) || max_tokens;
 
     totalInputTokens  += inputTokens;
     totalOutputTokens += outputTokens;
@@ -337,12 +340,11 @@ app.post('/api/messages', async (req,res) => {
       if(uid) recordUsage(uidStore, uid, isDeck, tokensUsed);
     }
 
-    // Deck oluşturma ise başlığı moderasyon listesine kaydet (JSON içinden title yakala)
     if(isDeck){
       try{
         const parsed = JSON.parse(text);
         if(parsed?.title) recordDeckTitle(parsed.title, uid);
-      }catch(e){ /* JSON değilse atla */ }
+      }catch(e){}
     }
 
     res.json({ content:[{type:'text', text}] });
